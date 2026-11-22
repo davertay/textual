@@ -8,9 +8,17 @@ import SwiftUI
 // - `run.imageURL` for images
 // - `run.textual.emojiURL` for custom emoji references emitted by pattern expansion
 //
-// This view asynchronously loads those URLs using the environment-provided attachment loaders and
-// writes the resolved attachments back into the attributed string as `Textual.Attachment`
-// attributes. The rest of the rendering pipeline treats attachment runs like any other span.
+// This view loads those URLs asynchronously using the environment-provided attachment loaders,
+// and derives its content in `body` by writing the attachments loaded so far back into the current
+// attributed string as `Textual.Attachment` attributes. The rest of the rendering pipeline treats
+// attachment runs like any other span.
+//
+// The text always comes from the current attributed string: an attachment only decorates a run
+// whose URL, text, and color environment it was loaded for, so changing content never shows a
+// previous string, and an attachment already loaded for earlier content appears immediately.
+// Loads are requested from `body`, rather than from `task(id:)` or `onChange`, which a rapidly
+// updating view can miss (SwiftUI runs those actions at most once per frame), and each attachment
+// is loaded once rather than once per content change.
 
 struct WithAttachments<Content: View>: View {
   @Environment(\.imageAttachmentLoader) private var imageAttachmentLoader
@@ -31,85 +39,106 @@ struct WithAttachments<Content: View>: View {
   }
 
   var body: some View {
-    content(model.resolvedAttributedString ?? attributedString)
-      .task(id: attributedString) {
-        await model.resolveAttachments(
-          in: attributedString,
-          imageAttachmentLoader: imageAttachmentLoader,
-          emojiAttachmentLoader: emojiAttachmentLoader,
-          environment: colorEnvironment
-        )
-      }
+    let _ = model.requestAttachments(
+      in: attributedString,
+      imageAttachmentLoader: imageAttachmentLoader,
+      emojiAttachmentLoader: emojiAttachmentLoader,
+      environment: colorEnvironment
+    )
+    content(model.applyingLoadedAttachments(to: attributedString, environment: colorEnvironment))
   }
 }
 
 extension WithAttachments {
   @MainActor @Observable final class Model {
-    var resolvedAttributedString: AttributedString?
+    struct Key: Hashable {
+      enum Kind: Hashable {
+        case image
+        case emoji
+      }
 
-    func resolveAttachments(
+      let kind: Kind
+      let url: URL
+      let text: String
+      let environment: ColorEnvironmentValues
+    }
+
+    private(set) var loaded: [Key: AnyAttachment] = [:]
+
+    @ObservationIgnored private var requested: Set<Key> = []
+
+    /// Starts loading the attachments `attributedString` refers to that haven't been requested
+    /// yet. Cheap to call on every `body` evaluation.
+    func requestAttachments(
       in attributedString: AttributedString,
       imageAttachmentLoader: any AttachmentLoader,
       emojiAttachmentLoader: any AttachmentLoader,
       environment: ColorEnvironmentValues
-    ) async {
-      guard attributedString.containsValues(for: [\.imageURL, \.textual.emojiURL]) else {
-        return
-      }
+    ) {
+      for run in attributedString.runs {
+        guard
+          let key = Self.key(for: run, in: attributedString, environment: environment),
+          requested.insert(key).inserted
+        else {
+          continue
+        }
 
-      var attachments: [AnyAttachment] = []
-      var ranges: [Range<AttributedString.Index>] = []
+        let loader =
+          switch key.kind {
+          case .image: imageAttachmentLoader
+          case .emoji: emojiAttachmentLoader
+          }
 
-      await withTaskGroup(
-        of: (AnyAttachment?, Range<AttributedString.Index>).self
-      ) { group in
-        for run in attributedString.runs {
-          if let imageURL = run.imageURL {
-            group.addTask {
-              let attachment = try? await imageAttachmentLoader.attachment(
-                for: imageURL,
-                text: String(attributedString[run.range].characters[...]),
-                environment: environment
-              )
-              return (attachment.map(AnyAttachment.init), run.range)
-            }
-          } else if let emojiURL = run.textual.emojiURL {
-            group.addTask {
-              let attachment = try? await emojiAttachmentLoader.attachment(
-                for: emojiURL,
-                text: String(attributedString[run.range].characters[...]),
-                environment: environment
-              )
-              return (attachment.map(AnyAttachment.init), run.range)
-            }
+        Task {
+          let attachment = try? await loader.attachment(
+            for: key.url,
+            text: key.text,
+            environment: key.environment
+          )
+          if let attachment {
+            loaded[key] = AnyAttachment(attachment)
           }
         }
-
-        for await (attachment, range) in group {
-          guard let attachment else { continue }
-
-          attachments.append(attachment)
-          ranges.append(range)
-        }
       }
-
-      resolveAttachmentsFinished(
-        attributedString: attributedString,
-        attachments: Array(zip(ranges, attachments))
-      )
     }
 
-    private func resolveAttachmentsFinished(
-      attributedString: AttributedString,
-      attachments: [(Range<AttributedString.Index>, AnyAttachment)]
-    ) {
-      var attributedString = attributedString
-
-      for (range, attachment) in attachments {
-        attributedString[range].textual.attachment = attachment
+    /// `attributedString` with every attachment loaded so far for its runs.
+    func applyingLoadedAttachments(
+      to attributedString: AttributedString,
+      environment: ColorEnvironmentValues
+    ) -> AttributedString {
+      guard !loaded.isEmpty else {
+        return attributedString
       }
 
-      self.resolvedAttributedString = attributedString
+      var output = attributedString
+
+      for run in attributedString.runs {
+        guard
+          let key = Self.key(for: run, in: attributedString, environment: environment),
+          let attachment = loaded[key]
+        else {
+          continue
+        }
+        output[run.range].textual.attachment = attachment
+      }
+
+      return output
+    }
+
+    private static func key(
+      for run: AttributedString.Runs.Run,
+      in attributedString: AttributedString,
+      environment: ColorEnvironmentValues
+    ) -> Key? {
+      let text = { String(attributedString[run.range].characters[...]) }
+
+      if let imageURL = run.imageURL {
+        return Key(kind: .image, url: imageURL, text: text(), environment: environment)
+      } else if let emojiURL = run.textual.emojiURL {
+        return Key(kind: .emoji, url: emojiURL, text: text(), environment: environment)
+      }
+      return nil
     }
   }
 }
